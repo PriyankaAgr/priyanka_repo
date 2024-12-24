@@ -1,0 +1,30 @@
+//Notification class is responsible to decide which notifi method to call based on argument passed
+//In the dependency inversion principle, high-level modules should not depend on low-level modules.
+ //In other words, you must follow abstraction and ensure loose coupling
+
+    public interface Notification{
+        public void notify();
+    }
+
+    public class Employee{
+        private Notification notification;
+        public Employee(Notification notification){
+            this.notification = notification;
+        }
+        public void notifyUser(){
+            notification.notify();
+        }
+    }
+
+    public class EmailNotification implements Notification{
+        public void notify(){
+            //implement notification via email
+        }
+    }
+
+    public static void main(String [] args){
+        Notification notification = new EmailNotification();
+        Employee employee = new Employee(notification);
+        employee.notifyUser();
+    }
+}
