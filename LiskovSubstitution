@@ -1,0 +1,32 @@
+//The Liskov substitution principle states that you must be able to replace a superclass object with a subclass object without affecting the correctness of the program.
+
+public interface Vehicle {
+
+  void calculateMileage();
+
+}
+
+interface ManualCar extends Vehicle{
+     void turnOnEngine();
+}
+
+interface ElectricCar extends Vehicle{
+     void accelerate();
+}
+
+public class MotorCar implements ManualCar {
+
+    private Engine engine;
+
+    //Constructors, getters + setters
+
+    public void turnOnEngine() {
+        //turn on the engine!
+        engine.on();
+    }
+
+    public void accelerate() {
+        //move forward!
+        engine.powerOn(1000);
+    }
+}
