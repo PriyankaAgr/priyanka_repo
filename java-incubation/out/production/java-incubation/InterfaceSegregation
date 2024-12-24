@@ -1,0 +1,33 @@
+//common interface -> implemented class bound to implement all methods
+interface IShapeAreaCalculator(){
+  double calculateArea();
+  double calculateVolume();
+}
+
+class Square implements IShapeAreaCalculator{
+  double calculateArea(){ // calculate the area }
+  double calculateVolume(){ // dummy implementation }
+}
+
+//segregating interface focussed on the reqd behaviour
+
+interface IAreaCalculator {
+    double calculateArea();
+}
+
+interface IVolumeCalculator {
+    double calculateVolume();
+}
+
+class Square implements IAreaCalculator {
+    @Override
+    public double calculateArea() { // calculate the area }
+}
+
+class Cube implements IAreaCalculator, IVolumeCalculator {
+    @Override
+    public double calculateArea() { // calculate the area }
+
+    @Override
+    public double calculateVolume() {// calculate the volume }
+}
