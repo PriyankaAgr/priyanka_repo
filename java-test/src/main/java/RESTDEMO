@@ -1,0 +1,46 @@
+//library
+/** Library id name city owner
+books /
+**/
+
+
+//rest endpoint crud urls rest method
+post is successful send response
+
+
+class Library{
+
+@Id
+@Generated()
+int id;
+String name;
+String city;
+String owner;
+
+}
+
+("/app/v1/library")
+@RestController
+
+
+@GetMapping("/getDetails")
+ResponseEntity<Library> getLibraryDetailsbyName(@PathParam("name") String name){
+
+        //call service get method
+        Optional<Library> response  =
+        if(response.isPresent())
+        return ResponseEntity.ok().message("");
+        else
+        return ResponseEntity.NOTFOUND().message("");
+
+
+}
+
+
+
+
+@PostMapping("/create")
+ResponseEntity
+
+
+@DeleteMapping
