@@ -1,0 +1,149 @@
+
+FR:
+
+realtime collaborative editing
+supported fn- insert, delete, undo, redo, 
+multi user sync
+versioning/history maintain
+multi user doc access and sharing
+access control by doc owner
+doc formatting- optional
+
+CLasses:
+
+User - username, email, contact
+
+Document - docid, version, name, content, Owner, List<user, permisiion>, 
+
+Command Interface -> EditCOmmand, InsertCommand, RedoCOmmand, UndoCOmmand, DeleteCOmmand
+
+InsertCommand - action,commanid, actor,
+
+COmmandType enum
+
+Design Patterns: 
+
+1, Observer pattern
+2. Singleton Pattern - single document instance creation
+3. Command Pattern for creating different commands
+4. Decorator pattern for formatting
+5,. strategy pattern for doc merge/sync
+
+
+
+Code->
+
+interface EditorCommand {
+
+void execute(StringBuilder content);
+void undo(StringBuilder content);
+}
+
+
+class InsertCommand extends EditorCommand{
+
+int pos;
+String text;
+
+InsertCommand(int pos, String text){
+}
+execute(StringBuilder  content){
+
+content.insert(pos, text);
+}
+
+ public void undo(StringBuilder content) {
+        content.delete(position, position + text.length());
+    }
+}
+
+public class DeleteCommand implements EditorCommand {
+    private final int position;
+    private final int length;
+
+    public DeleteCommand(int position, int length) {
+        this.position = position;
+        this.length = length;
+    }
+
+    public void execute(StringBuilder content) {
+        if (position >= 0 && position + length <= content.length()) {
+            content.delete(position, position + length);
+        }
+    }
+
+
+class Document {
+  private final String docId;
+private final String docName;
+private final USer owner;
+    private final StringBuilder content;
+    private final List<Change> changeHistory;
+
+    public Document(String docId, String name, User user) {
+        this.docId = docId;
+        this.name = name;
+        this.user=user;
+        this.content = new StringBuilder();
+        this.changeHistory = new ArrayList<>();
+    }
+
+
+public synchronized void apply(Command command){
+
+command.execute(content);
+changeHistory.add(new Change(command));
+}
+
+
+    public synchronized void undoLast() {
+        if (!changeHistory.isEmpty()) {
+            Change last = changeHistory.remove(changeHistory.size() - 1);
+            last.getCommand().undo(content);
+        }
+    }
+
+    public String getContent() {
+        return content.toString();
+    }
+}
+
+class DocumentMergeService {
+    private final Set<User> activeUsers = ConcurrentHashMap.newKeySet();
+    private final ExecutorService executor = Executors.newFixedThreadPool(10);
+    Document document;
+
+DocumentMergeService(Document document){
+this.document = document;
+}
+
+void merge(User user, Command command){
+executor.submit(() -> {
+            synchronized (document) {
+                document.applyCommand(command);
+                notifyAllUsers(document.getContent());
+            }
+        });
+    }
+};
+
+
+
+Main{
+
+Document d1 = new Document(D01, "Resume",  User1, "Insert");
+EditorCommand command;
+if(d1.type==Insert){
+
+command = new InsertCommand(0, "abc");
+}
+
+DocumentMergeService mergeService = new DocumentMergeService(d1);
+
+mergeService.merge(u1, command);
+
+}
+
+
+
+ 
