@@ -1,0 +1,56 @@
+
+## FR:
+
+1.  on order bills shud be generated.
+2. bills shud be genrated after applying discounts
+3. bill contains order details, customer details, payment details
+4. multiple currency shud be supported
+5. tax calculation based on the product and region
+6. bill generation shud be idempotent.
+
+## class design:
+
+Invoice - invoiceid, inv_num, inv_date_time, customer_id, order_id, taxamt, disc_amt , coupon_code, total_amt w/o tax, total_with_tax
+
+Order- orderid, List<product>, customer_id
+
+Product-prodid, name, category, price
+
+Customer- cust_id, name, contact, email
+
+Promotion- id, category, name, code, start_date, expiry_date, 
+
+Tax -  taxid, product_id, tax_val
+
+## Design Pattern->
+
+Singleton for invoicing
+
+Strategy- > tax calculation and amt
+
+builder -> invoice object building
+
+factory-> 
+
+observer-> invoice send in mail
+
+
+Main->
+
+Customer
+
+Invoice inv = new Invoice();
+
+calculateInvoice(order, customer){
+
+Product->price
+total price
+fetch tax based on product
+amt_with tax calc = total_amt;
+
+inv.setTotalAMt(total_amt);
+
+displayInvoice(){
+//print invoice
+}
+

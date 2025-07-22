@@ -1,0 +1,152 @@
+#LLD Logger system:
+
+FR:
+1. system shud be able to capture logs
+2. different service shud be able to pass logs
+3. diff log level will be there like ino, debug, error
+4. logging shud be safe in multithreading system
+5. log o/p shud be appended in file, console based on user pref
+
+6. user shud be able to fetch log by log guid.
+
+##CLasses:
+
+LogLevel (Enum)- INFO, DEBUG, ERROR, WARN
+
+LogAppender(Interface)- Console, File, DB, ..
+
+User-
+Logger- logid,
+
+LogMesg- mesgid, mesg, 
+
+##Design Pattern- 
+Factory Design pattern - to create logger instance
+observer design pattern- to send log notification
+builder design pattern -  add multiple logger config , 
+Singleton - for single logger instance
+DecoratorPattern (optional)- if want to enhance/format logger instance after creation
+
+
+LoggerFactory{
+
+if(logappended=='console'){
+  return new ConsoleAppender(logmesg, loggertype);
+file---
+db--
+
+synchronised createLoggerInstance(){
+}
+
+
+
+interface LogAppender{
+
+public void log(String msg);
+}
+
+class ConsoleAppender implements LogAppender{
+
+public void log(String logMesg){
+console.log(logMesg)
+}
+}
+ 
+class FileAppender implements LogAppender{
+    private String filePath;
+
+public void log(String logMesg){
+try (FileWriter writer = new FileWriter(filePath, true)) {
+            writer.write(logMesg + "\n");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+}
+ 
+
+class DBAppender implements LogAppender{
+
+public void log(String logMesg){
+db.log(logMesg);
+}
+}
+ 
+//Decorator pattern
+
+interface LogFormatter{
+
+public String format(String msg, Loglevel level);
+}
+
+class TimeStampFormatter implements LogFormatter{
+    public String format(String msg, Loglevel level);
+        
+
+}
+
+
+}
+
+
+public class Logger {
+    private static Logger instance;
+    private LogHandler logHandler;
+    private LogFormatter formatter;
+    private LogLevel minLevel = LogLevel.DEBUG;
+
+    private Logger() {}
+
+    public static synchronized Logger getInstance() {
+        if (instance == null)
+            instance = new Logger();
+        return instance;
+    }
+
+    public void setHandler(LogHandler handler) {
+        this.logHandler = handler;
+    }
+
+    public void setFormatter(LogFormatter formatter) {
+        this.formatter = formatter;
+    }
+
+    public void setMinLogLevel(LogLevel level) {
+        this.minLevel = level;
+    }
+
+    public void log(String message, LogLevel level) {
+        if (level.ordinal() >= minLevel.ordinal()) {
+            String formatted = formatter.format(message, level);
+            logHandler.log(formatted);
+        }
+    }
+}
+
+
+public class Main {
+    public static void main(String[] args) {
+        Logger logger = Logger.getInstance();
+
+        // Strategy + Decorator setup
+        LogHandler fileHandler = new FileLogHandler("logs.txt");
+        LogFormatter formatter = new TimestampFormatter(
+                                    new LevelFormatter(
+                                        new BasicFormatter()));
+
+        logger.setHandler(fileHandler);
+        logger.setFormatter(formatter);
+        logger.setMinLogLevel(LogLevel.INFO);
+
+        logger.log("This is a debug message", LogLevel.DEBUG); // Ignored
+        logger.log("This is info", LogLevel.INFO);
+        logger.log("Something went wrong", LogLevel.ERROR);
+    }
+}
+
+
+
+}
+
+
+
+
