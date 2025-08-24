@@ -1,0 +1,441 @@
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+/* =========================
+   Core Identities & ACL
+   ========================= */
+
+    final class UserId {
+        private final String id;
+        public UserId(String id) { this.id = Objects.requireNonNull(id); }
+        public String id() { return id; }
+        @Override public boolean equals(Object o){ return (o instanceof UserId u) && u.id.equals(id); }
+        @Override public int hashCode(){ return id.hashCode(); }
+        @Override public String toString(){ return id; }
+    }
+
+    enum Role { VIEWER, COMMENTER, EDITOR, OWNER }
+
+    final class Acl {
+        private final Map<UserId, Role> map = new ConcurrentHashMap<>();
+        public void grant(UserId u, Role r) { map.put(u, r); }
+        public void revoke(UserId u) { map.remove(u); }
+        public Role roleOf(UserId u){ return map.getOrDefault(u, null); }
+        public boolean canView(UserId u){ return map.containsKey(u); }
+        public boolean canEdit(UserId u){ Role r = map.get(u); return r == Role.EDITOR || r == Role.OWNER; }
+        public boolean isOwner(UserId u){ return map.get(u) == Role.OWNER; }
+    }
+
+    final class DocumentId {
+        private final String id;
+        public DocumentId(String id){ this.id = id; }
+        public String id(){ return id; }
+        @Override public boolean equals(Object o){ return (o instanceof DocumentId d) && d.id.equals(id); }
+        @Override public int hashCode(){ return id.hashCode(); }
+        @Override public String toString(){ return id; }
+    }
+
+/* =========================
+   Document + Snapshot (Memento)
+   ========================= */
+
+    final class DocumentSnapshot {
+        final long version;
+        final String content;
+        final Instant at;
+        DocumentSnapshot(long version, String content) {
+            this.version = version; this.content = content; this.at = Instant.now();
+        }
+    }
+
+    interface DocumentListener {
+        void onDocumentUpdated(DocumentId id, long newVersion, String newContent);
+    }
+
+    final class TextDocument {
+        private final DocumentId id;
+        private final Acl acl;
+        private final List<DocumentListener> listeners = new CopyOnWriteArrayList<>();
+
+        // guarded by EditSession ordering; additional sync inside for safety
+        private final StringBuilder content = new StringBuilder();
+        private volatile long version = 0L; // monotonic version
+
+        public TextDocument(DocumentId id, UserId owner) {
+            this.id = id;
+            this.acl = new Acl();
+            acl.grant(owner, Role.OWNER);
+        }
+
+        public DocumentId id(){ return id; }
+        public long version(){ return version; }
+        public String content(){ synchronized (content) { return content.toString(); } }
+        public Acl acl(){ return acl; }
+
+        void addListener(DocumentListener l){ listeners.add(l); }
+
+        DocumentSnapshot snapshot(){ synchronized (content) { return new DocumentSnapshot(version, content.toString()); } }
+
+        // Apply insert/delete atomically, assumes correctness of positions (validated by merge strategy).
+        void apply(EditOp op) {
+            synchronized (content) {
+                if (op instanceof InsertOp ins) {
+                    int pos = ins.position();
+                    content.insert(pos, ins.text());
+                } else if (op instanceof DeleteOp del) {
+                    int pos = del.position();
+                    int len = del.length();
+                    content.delete(pos, pos + len);
+                }
+                version++;
+            }
+            listeners.forEach(l -> l.onDocumentUpdated(id, version, content()));
+        }
+    }
+
+/* =========================
+   Edit Operations + Command
+   ========================= */
+
+    abstract class EditOp {
+        private final DocumentId docId;
+        private final UserId user;
+        private final long baseVersion;     // the version user saw before editing
+        private final long lamport;         // tiebreak (increasing)
+        protected EditOp(DocumentId docId, UserId user, long baseVersion, long lamport) {
+            this.docId = docId; this.user = user; this.baseVersion = baseVersion; this.lamport = lamport;
+        }
+        public DocumentId docId(){ return docId; }
+        public UserId user(){ return user; }
+        public long baseVersion(){ return baseVersion; }
+        public long lamport(){ return lamport; }
+    }
+
+    final class InsertOp extends EditOp {  //abcde
+        private final int position;
+        private final String text;
+        public InsertOp(DocumentId docId, UserId user, long baseVersion, long lamport, int position, String text) {
+            super(docId, user, baseVersion, lamport);
+            this.position = position; this.text = text;
+        }
+        public int position(){ return position; }
+        public String text(){ return text; }
+        @Override public String toString(){ return "Insert(" + position + ",\"" + text + "\")@v" + baseVersion(); }
+    }
+
+    final class DeleteOp extends EditOp { //abcde (1,2)=> ade
+        private final int position;
+        private final int length;
+        public DeleteOp(DocumentId docId, UserId user, long baseVersion, long lamport, int position, int length) {
+            super(docId, user, baseVersion, lamport);
+            this.position = position; this.length = length;
+        }
+        public int position(){ return position; }
+        public int length(){ return length; }
+        @Override public String toString(){ return "Delete(" + position + "," + length + ")@v" + baseVersion(); }
+    }
+
+    interface Command { void execute() throws Exception; }
+
+    final class EditCommand implements Command {
+        private final EditSession session;
+        private final EditOp op;
+        public EditCommand(EditSession s, EditOp op){ this.session = s; this.op = op; }
+        @Override public void execute() { session.submit(op); }
+    }
+
+/* =========================
+   Merge Strategy (Strategy Pattern)
+   Simple Operational Transform (OT-lite) for inserts/deletes on a linear buffer
+   ========================= */
+
+    interface MergeStrategy {
+        /**
+         * Transform 'incoming' against a list of 'concurrent' ops (applied after incoming.baseVersion).
+         * Return a new op ready to apply at the document's current state.
+         * If the op becomes a no-op (e.g., delete of already-deleted range), return Optional.empty().
+         */
+        Optional<EditOp> transform(EditOp incoming, List<EditOp> concurrentHistory);
+    }
+
+    final class OTLinearTextStrategy implements MergeStrategy {
+
+        @Override
+        public Optional<EditOp> transform(EditOp inc, List<EditOp> hist) {
+            EditOp cur = inc;
+            for (EditOp h : hist) {
+                cur = transformPair(cur, h);
+                if (cur == null) return Optional.empty();
+            }
+            return Optional.of(cur);
+        }
+
+        // Pairwise transform: adjust positions/lengths of 'a' against already-applied 'b'
+        private EditOp transformPair(EditOp a, EditOp b) {
+            if (a instanceof InsertOp ai && b instanceof InsertOp bi) {
+                int pos = ai.position();
+                if (bi.position() < pos || (bi.position() == pos && tieBreak(bi, ai))) {
+                    return new InsertOp(ai.docId(), ai.user(), ai.baseVersion(), ai.lamport(), pos + bi.text().length(), ai.text());
+                }
+                return a;
+            }
+            if (a instanceof InsertOp ai2 && b instanceof DeleteOp bd) {
+                int pos = ai2.position();   // a(b)cd_ef =acdef
+                if (bd.position() < pos) {
+                    int shift = Math.min(bd.length(), Math.max(0, pos - bd.position()));
+                    return new InsertOp(ai2.docId(), ai2.user(), ai2.baseVersion(), ai2.lamport(), pos - shift, ai2.text());
+                }
+                return a;
+            }
+            if (a instanceof DeleteOp ad && b instanceof InsertOp bi2) {
+                int pos = ad.position();
+                if (bi2.position() <= pos) {
+                    return new DeleteOp(ad.docId(), ad.user(), ad.baseVersion(), ad.lamport(), pos + bi2.text().length(), ad.length());
+                } else if (bi2.position() < pos + ad.length()) {
+                    // Insert splits the delete range; extend delete by inserted length to keep semantics
+                    return new DeleteOp(ad.docId(), ad.user(), ad.baseVersion(), ad.lamport(), pos, ad.length() + bi2.text().length());
+                }
+                return a;
+            }
+            if (a instanceof DeleteOp ad2 && b instanceof DeleteOp bd2) {
+                int aStart = ad2.position(), aEnd = aStart + ad2.length();
+                int bStart = bd2.position(), bEnd = bStart + bd2.length();
+                if (bEnd <= aStart) {
+                    // prior delete before our range -> shift left
+                    int shift = bEnd - bStart;
+                    return new DeleteOp(ad2.docId(), ad2.user(), ad2.baseVersion(), ad2.lamport(), aStart - shift, ad2.length());
+                }
+                if (bStart >= aEnd) {
+                    // prior delete after our range -> unaffected
+                    return a;
+                }
+                // overlap: shrink our delete by the overlap already removed
+                int overlapStart = Math.max(aStart, bStart);
+                int overlapEnd = Math.min(aEnd, bEnd);
+                int overlap = Math.max(0, overlapEnd - overlapStart);
+                int newStart = Math.min(aStart, bStart) == aStart ? aStart : bStart < aStart ? aStart - (Math.min(bd2.length(), aStart - bStart)) : aStart;
+                int newLen = ad2.length() - overlap;
+                if (newLen <= 0) return null; // becomes no-op
+                return new DeleteOp(ad2.docId(), ad2.user(), ad2.baseVersion(), ad2.lamport(), newStart, newLen);
+            }
+            return a;
+        }
+
+        // deterministic tiebreak for simultaneous inserts at same position
+        private boolean tieBreak(InsertOp leftApplied, InsertOp rightIncoming) {
+            // earlier lamport wins; if equal, smaller user id wins
+            if (leftApplied.lamport() != rightIncoming.lamport()) {
+                return leftApplied.lamport() < rightIncoming.lamport();
+            }
+            return leftApplied.user().id().compareTo(rightIncoming.user().id()) <= 0;
+        }
+    }
+
+/* =========================
+   Edit Session (multithreaded apply pipeline) + Repository
+   ========================= */
+
+    interface DocumentRepository {
+        TextDocument save(TextDocument d);
+        Optional<TextDocument> findById(DocumentId id);
+    }
+
+    final class InMemoryDocumentRepository implements DocumentRepository {
+        private final Map<DocumentId, TextDocument> store = new ConcurrentHashMap<>();
+        public TextDocument save(TextDocument d){ store.put(d.id(), d); return d; }
+        public Optional<TextDocument> findById(DocumentId id){ return Optional.ofNullable(store.get(id)); }
+    }
+
+    /**
+     * EditSession:
+     *  - Public submit(EditOp) is non-blocking (puts op in a queue).
+     *  - A single applier thread orders operations, transforms them (merge strategy), applies to the doc.
+     *  - Maintains an append-only history to transform future concurrent ops (OT-lite).
+     */
+    final class EditSession {
+        private final TextDocument doc;
+        private final MergeStrategy merge;
+        private final BlockingQueue<EditOp> inbox = new LinkedBlockingQueue<>();
+        private final List<EditOp> history = new CopyOnWriteArrayList<>();
+        private final ExecutorService applier = Executors.newSingleThreadExecutor();
+        private volatile boolean running = true;
+
+        public EditSession(TextDocument doc, MergeStrategy merge) {
+            this.doc = doc; this.merge = merge;
+            applier.submit(this::runLoop);
+        }
+
+        public void stop() {
+            running = false; applier.shutdownNow();
+        }
+
+        public long currentVersion(){ return doc.version(); }
+        public String currentContent(){ return doc.content(); }
+
+        public void submit(EditOp op) {
+            // Authorization check (edit)
+            if (!doc.acl().canEdit(op.user())) throw new SecurityException("No edit permission");
+            inbox.offer(op);
+        }
+
+        private void runLoop() {
+            try {
+                while (running) {
+                    EditOp op = inbox.poll(500, TimeUnit.MILLISECONDS);
+                    if (op == null) continue;
+
+                    // Collect concurrent ops applied since op.baseVersion
+                    long nowVersion = doc.version();
+                    List<EditOp> concurrent = new ArrayList<>();
+                    for (EditOp h : history) {
+                        if (h.baseVersion() >= op.baseVersion() && h.baseVersion() < nowVersion) {
+                            concurrent.add(h);
+                        }
+                    }
+                    Optional<EditOp> transformed = merge.transform(op, concurrent);
+                    if (transformed.isEmpty()) continue;
+
+                    EditOp ready = transformed.get();
+                    applySafely(ready);
+                }
+            } catch (InterruptedException ignore) { Thread.currentThread().interrupt(); }
+        }
+
+        private void applySafely(EditOp op) {
+            // Bounds check vs current content length
+            String content = doc.content();
+            if (op instanceof InsertOp ins) {
+                int pos = Math.max(0, Math.min(ins.position(), content.length()));
+                EditOp bounded = new InsertOp(ins.docId(), ins.user(), doc.version(), ins.lamport(), pos, ins.text());
+                doc.apply(bounded);
+                history.add(new InsertOp(ins.docId(), ins.user(), doc.version()-1, ins.lamport(), pos, ins.text()));
+            } else if (op instanceof DeleteOp del) {
+                int pos = Math.max(0, Math.min(del.position(), content.length()));
+                int len = Math.max(0, Math.min(del.length(), content.length() - pos));
+                if (len == 0) return;
+                EditOp bounded = new DeleteOp(del.docId(), del.user(), doc.version(), del.lamport(), pos, len);
+                doc.apply(bounded);
+                history.add(new DeleteOp(del.docId(), del.user(), doc.version()-1, del.lamport(), pos, len));
+            }
+        }
+    }
+
+/* =========================
+   Collaboration Service (Facade)
+   ========================= */
+
+    final class CollaborationService {
+        private final DocumentRepository repo;
+        private final Map<DocumentId, EditSession> sessions = new ConcurrentHashMap<>();
+        private final AtomicLong lamport = new AtomicLong(0);
+
+        public CollaborationService(DocumentRepository repo) { this.repo = repo; }
+
+        public TextDocument createDoc(UserId owner, String initial) {
+            TextDocument d = new TextDocument(new DocumentId(UUID.randomUUID().toString()), owner);
+            // bootstrap initial content
+            if (initial != null && !initial.isEmpty()) {
+                d.apply(new InsertOp(d.id(), owner, 0, lamport.incrementAndGet(), 0, initial));
+            }
+            repo.save(d);
+            sessions.put(d.id(), new EditSession(d, new OTLinearTextStrategy()));
+            return d;
+        }
+
+        public void share(DocumentId id, UserId actor, UserId target, Role role) {
+            TextDocument d = repo.findById(id).orElseThrow();
+            if (!d.acl().isOwner(actor)) throw new SecurityException("Only owner can share");
+            d.acl().grant(target, role);
+        }
+
+        public void addListener(DocumentId id, DocumentListener l) {
+            repo.findById(id).orElseThrow().addListener(l);
+        }
+
+        public long version(DocumentId id) { return repo.findById(id).orElseThrow().version(); }
+        public String content(DocumentId id) { return repo.findById(id).orElseThrow().content(); }
+
+        public void insert(DocumentId id, UserId user, int pos, String text) {
+            TextDocument d = repo.findById(id).orElseThrow();
+            long baseVersion = d.version();
+            EditSession s = sessions.get(id);
+            new EditCommand(s, new InsertOp(id, user, baseVersion, lamport.incrementAndGet(), pos, text)).execute();
+        }
+
+        public void delete(DocumentId id, UserId user, int pos, int len) {
+            TextDocument d = repo.findById(id).orElseThrow();
+            long baseVersion = d.version();
+            EditSession s = sessions.get(id);
+            new EditCommand(s, new DeleteOp(id, user, baseVersion, lamport.incrementAndGet(), pos, len)).execute();
+        }
+
+        public DocumentSnapshot snapshot(DocumentId id) {
+            return repo.findById(id).orElseThrow().snapshot();
+        }
+
+        public void shutdown() {
+            sessions.values().forEach(EditSession::stop);
+        }
+    }
+
+/* =========================
+   Demo / Main
+   ========================= */
+
+    public class CollabDocDemo {
+        public static void main(String[] args) throws InterruptedException {
+            DocumentRepository repo = new InMemoryDocumentRepository();
+            CollaborationService svc = new CollaborationService(repo);
+
+            UserId owner = new UserId("alice");
+            UserId bob   = new UserId("bob");
+            UserId chad  = new UserId("chad");
+
+            // Create and share
+            TextDocument doc = svc.createDoc(owner, "Hello world");
+            svc.share(doc.id(), owner, bob, Role.EDITOR);
+            svc.share(doc.id(), owner, chad, Role.EDITOR);
+
+            // Subscribe to live updates (Observer)
+            svc.addListener(doc.id(), (id, v, content) ->
+                    System.out.println("[Update] v" + v + " -> \"" + content + "\""));
+
+            // Two concurrent editors (multithreading)
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+
+            // Bob appends and inserts near the start
+            pool.submit(() -> {
+                try {
+                    Thread.sleep(30);
+                    svc.insert(doc.id(), bob, 5, ", brave");
+                    Thread.sleep(20);
+                    svc.insert(doc.id(), bob, svc.content(doc.id()).length(), "!!!");
+                } catch (Exception e) { e.printStackTrace(); }
+            });
+
+            // Chad deletes "world" and inserts "collaborators"
+            pool.submit(() -> {
+                try {
+                    Thread.sleep(10);
+                    int idx = svc.content(doc.id()).indexOf("world");
+                    if (idx >= 0) {
+                        svc.delete(doc.id(), chad, idx, "world".length());
+                        Thread.sleep(10);
+                        svc.insert(doc.id(), chad, idx, "collaborators");
+                    }
+                } catch (Exception e) { e.printStackTrace(); }
+            });
+
+            pool.shutdown();
+            pool.awaitTermination(2, TimeUnit.SECONDS);
+
+            // Take a snapshot
+            DocumentSnapshot snap = svc.snapshot(doc.id());
+            System.out.println("\nFinal (v" + snap.version + "): \"" + snap.content + "\" at " + snap.at);
+
+            svc.shutdown();
+        }
+    }
+
